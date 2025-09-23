@@ -50,10 +50,19 @@ except Exception:  # pragma: no cover
 # Canonical shared definitions
 # =============================
 ADDUCT_MASS: Dict[str, float] = {
-    "[M+H]+": 1.007276466,
-    "[M+Na]+": 22.989218,     # Na+
-    "[M+K]+": 38.963157,      # K+
-    "[M+NH4]+": 18.033823,    # NH4+
+    "[M+H]+":   1.007276466,
+    "[M+Na]+":  22.989218,     # Na+
+    "[M+K]+":   38.963157,     # K+
+    "[M+NH4]+": 18.033823,     # NH4+
+    "[M+2H]+2": 2 * 1.007276466,  # doubly protonated
+}
+
+ADDUCT_CHARGE: Dict[str, int] = {
+    "[M+H]+": 1,
+    "[M+Na]+": 1,
+    "[M+K]+": 1,
+    "[M+NH4]+": 1,
+    "[M+2H]+2": 2,
 }
 
 _num_re = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
@@ -163,23 +172,71 @@ def _add_inchikey(df: pd.DataFrame, smiles_col: str = "SMILES", out_col: str = "
             return None
     df[out_col] = df[smiles_col].apply(smi_to_inchikey)
 
-def merge_dataframes(df_list: List[pd.DataFrame], key_column: str) -> pd.DataFrame:
-    """Merge multiple dataframes on a key, create presence indicator columns per source.
+from typing import List, Sequence, Optional
+import pandas as pd
+
+def merge_dataframes(
+    df_list: List[pd.DataFrame],
+    key_column: str,
+    name_columns: Optional[Sequence[str]] = None,
+    unified_name_col: str = "Compound name (unified)",
+) -> pd.DataFrame:
+    """
+    Merge multiple DataFrames on `key_column`, add presence flags per source,
+    and create a unified compound-name column by coalescing across `name_columns`.
+    Original name columns are preserved.
 
     Parameters
     ----------
-    df_list : list of DataFrames
+    df_list : list[pd.DataFrame]
     key_column : str
-        Column to use as the merge key across frames.
+        Column used as the merge key across frames.
+    name_columns : sequence[str], optional
+        Candidate columns that may contain the compound name (e.g., ["Compound name","Name"]).
+        The first non-empty value among these (left-to-right) is used.
+    unified_name_col : str
+        Output column name for the unified compound name.
+
+    Returns
+    -------
+    pd.DataFrame
     """
-    merged_df = pd.concat(df_list, axis=0, ignore_index=True)
-    merged_df = merged_df.pivot_table(index=key_column, aggfunc="first").reset_index()
-    # Presence flags per original DF
-    for i, df in enumerate(df_list):
-        col_name = f"additional_column_{i+1}"
-        merged_df[col_name] = merged_df[key_column].isin(df[key_column]).astype(int)
-    merged_df = merged_df.fillna(0)
-    return merged_df
+    # 1) Row/column union without dropping anything
+    merged = pd.concat(df_list, axis=0, ignore_index=True, sort=False)
+
+    # 2) Build unified name column by coalescing across possible headers
+    if name_columns:
+        present = [c for c in name_columns if c in merged.columns]
+        if present:
+            # start with all-NA string series
+            out = pd.Series(pd.NA, index=merged.index, dtype="string")
+            for c in present:
+                s = merged[c].astype("string", errors="ignore")
+                s = s.astype("string") if s.dtype != "string" else s
+                s = s.str.strip()
+                s = s.mask(s.eq("") | s.isna(), pd.NA)
+                out = out.fillna(s)
+            merged[unified_name_col] = out
+        else:
+            # none of the suggested columns exist; create empty unified column
+            merged[unified_name_col] = pd.Series(pd.NA, index=merged.index, dtype="string")
+
+    # 3) Collapse duplicates by key (keep first occurrence; preserves non-numeric cols)
+    if key_column in merged.columns:
+        merged = (merged
+                  .sort_values(key_column, kind="stable")
+                  .drop_duplicates(subset=[key_column], keep="first"))
+    else:
+        raise KeyError(f"`key_column` '{key_column}' not found in merged columns.")
+
+    # 4) Presence flags per original DF
+    for i, df in enumerate(df_list, start=1):
+        col = f"additional_column_{i}"
+        keys = df[key_column].dropna().unique() if key_column in df.columns else []
+        merged[col] = merged[key_column].isin(keys).astype("Int8")  # 0/1, nullable int
+
+    return merged
+
 
 import re
 import pandas as pd
@@ -450,8 +507,13 @@ def compute_adduct_mzs(mono_mass: float, adducts: Optional[Sequence[str]] = None
     """Return dict {adduct: m/z} as floats (format later when emitting query)."""
     if adducts is None:
         adducts = list(ADDUCT_MASS.keys())
-    return {a: mono_mass + ADDUCT_MASS[a] for a in adducts}
-
+    mzs: Dict[str, float] = {}
+    for a in adducts:
+        if a not in ADDUCT_MASS:
+            raise KeyError(f"Unknown adduct '{a}'. Known: {list(ADDUCT_MASS.keys())}")
+        z = ADDUCT_CHARGE.get(a, 1)
+        mzs[a] = (mono_mass + ADDUCT_MASS[a]) / z
+    return mzs
 
 def massql_query_for_compound(
     name: str,
@@ -462,13 +524,9 @@ def massql_query_for_compound(
     decimals: int = 5,
     separate_adducts: bool = False,
 ) -> str | Dict[str, str]:
-    """Build MassQL query(ies) for one compound (MS1).
-
-    If separate_adducts=False: returns ONE query string with all adduct m/z joined by OR.
-    If separate_adducts=True: returns a dict {adduct: query_string} (one per adduct).
-    """
+    """Build MassQL query(ies) for one compound (MS1)."""
     if adducts is None:
-        adducts = ("[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+")
+        adducts = ("[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+", "[M+2H]+2")
 
     mzs = compute_adduct_mzs(mono_mass, adducts=adducts)
 
@@ -482,7 +540,7 @@ def massql_query_for_compound(
         )
         return q
 
-    out = {}
+    out: Dict[str, str] = {}
     for a in adducts:
         q = (
             f"# {name} {a}\n"
@@ -492,7 +550,6 @@ def massql_query_for_compound(
         )
         out[a] = q
     return out
-
 
 def generate_massql_queries(
     df_metadata: pd.DataFrame,
@@ -504,15 +561,9 @@ def generate_massql_queries(
     name_col: str = "Compound name",
     mass_col: str = "MolWeight",
 ) -> Dict[str, str] | Dict[str, Dict[str, str]]:
-    """Build MassQL MS1 queries from a metadata dataframe.
-
-    Returns
-    -------
-    separate_adducts=False: dict {compound_name: query_string}
-    separate_adducts=True : dict {compound_name: {adduct: query_string}}
-    """
+    """Build MassQL MS1 queries from a metadata dataframe."""
     if adducts is None:
-        adducts = ("[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+")
+        adducts = ("[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+", "[M+2H]+2")
 
     name_col = _resolve_column(df_metadata, name_col)
     mass_col = _resolve_column(df_metadata, mass_col)
@@ -539,12 +590,25 @@ def generate_massql_queries(
 # MassQL (MS2)
 # =============================
 
+def _prec_mzs(mono_mass: float, adducts: Sequence[str], decimals: int) -> List[str]:
+    """Return formatted precursor m/z strings for the given adducts, charge-aware."""
+    mz_list: List[str] = []
+    for a in adducts:
+        a_norm = a.strip()
+        if a_norm not in ADDUCT_MASS:
+            # silently skip unknown adducts
+            continue
+        z = ADDUCT_CHARGE.get(a_norm, 1)
+        mz = (mono_mass + ADDUCT_MASS[a_norm]) / z
+        mz_list.append(_fmt(mz, decimals))
+    return mz_list
+
 def generate_massql_ms2_queries(
     df_metadata: pd.DataFrame,
     name_col: str = "Compound name",
     mass_col: str = "Monoisotopic mass",  # or "MolWeight"
     fragments_col: str = "Fragments",
-    adducts: Optional[Sequence[str]] = None,  # default: H, Na, K, NH4
+    adducts: Optional[Sequence[str]] = None,
     ppm_prec: int = 10,
     ppm_prod: int = 10,
     intensity_percent: int = 5,
@@ -554,13 +618,14 @@ def generate_massql_ms2_queries(
     clamp_cardinality: bool = True,
     ignore_zero_fragments: bool = True,
 ) -> Dict[str, str]:
-    """Per-row MS2 query builder.
+    """
+    Build per-row MassQL MS2 queries.
 
-    If a row has fragments (semicolon/space/comma separated numbers), include MS2PROD with
-    CARDINALITY and intensity threshold. Otherwise, only restrict by MS2PREC (precursor list).
+    If a row has fragment m/z values (semicolon/space/comma separated), include MS2PROD with
+    CARDINALITY and INTENSITYPERCENT. Otherwise, restrict only by MS2PREC (precursor list).
     """
     if adducts is None:
-        adducts = ("[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+")
+        adducts = ("[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+", "[M+2H]+2")
 
     name_col = _resolve_column(df_metadata, name_col)
     mass_col = _resolve_column(df_metadata, mass_col)
@@ -574,12 +639,16 @@ def generate_massql_ms2_queries(
         if mono is None:
             continue
 
-        prec_list = " OR ".join(_prec_mzs(mono, adducts, decimals))
+        precs = _prec_mzs(mono, adducts, decimals)
+        if not precs:
+            # no valid adducts -> skip row
+            continue
+        prec_list = " OR ".join(precs)
 
-        # Parse fragments
+        # parse fragments
         frags: List[float] = []
         raw = row[fragments_col]
-        if pd.notna(raw) and str(raw).strip() != "":
+        if pd.notna(raw) and str(raw).strip():
             tokens = re.split(r"[;,\s]+", str(raw))
             seen: set[float] = set()
             for t in tokens:
@@ -595,13 +664,8 @@ def generate_massql_ms2_queries(
 
         if frags:
             n = len(frags)
-            cmin = min(cardinality_min, n) if clamp_cardinality else cardinality_min
-            cmax = min(cardinality_max, n) if clamp_cardinality else cardinality_max
-            if cmin < 1:
-                cmin = 1
-            if cmax < cmin:
-                cmax = cmin
-
+            cmin = max(1, min(cardinality_min, n) if clamp_cardinality else cardinality_min)
+            cmax = max(cmin, min(cardinality_max, n) if clamp_cardinality else cardinality_max)
             prod_list = " OR ".join(_fmt(v, decimals) for v in frags)
             q = (
                 f"# {name}\n"
@@ -616,6 +680,7 @@ def generate_massql_ms2_queries(
                 "QUERY scaninfo(MS2DATA) WHERE\n"
                 f"MS2PREC=({prec_list}):TOLERANCEPPM={ppm_prec}"
             )
+
         results[name] = q
 
     return results
@@ -741,6 +806,50 @@ def build_similarity_network(
 
     return links_filtered, G, isolated_df
 
+def add_massdiff_from_metadata(
+    links_df: pd.DataFrame,
+    metadata_df: pd.DataFrame,
+    *,
+    id_col: str = "InchiKey",
+    weight_col: str = "MolWeight",
+    source_col: str = "SOURCE",
+    target_col: str = "TARGET",
+    drop_missing_weights: bool = False,
+    add_ppm: bool = False
+) -> pd.DataFrame:
+    """
+    Add SOURCE_MW, TARGET_MW, and MassDiff_Da to links_df using weights from metadata_df[weight_col]
+    keyed by metadata_df[id_col]. Optionally add MassDiff_ppm.
+    """
+    # Basic column checks
+    for col in (source_col, target_col):
+        if col not in links_df.columns:
+            raise ValueError(f"links_df must contain '{col}' column.")
+    for col in (id_col, weight_col):
+        if col not in metadata_df.columns:
+            raise ValueError(f"metadata_df must contain '{col}' column.")
+
+    # Build a mapping InchiKey -> MolWeight (first occurrence if duplicates)
+    weight_map = (
+        metadata_df[[id_col, weight_col]]
+        .drop_duplicates(subset=[id_col])
+        .set_index(id_col)[weight_col]
+    )
+    weight_map = pd.to_numeric(weight_map, errors="coerce")  # ensure numeric
+
+    out = links_df.copy()
+    out["SOURCE_MW"] = out[source_col].map(weight_map)
+    out["TARGET_MW"] = out[target_col].map(weight_map)
+    out["MassDiff_Da"] = (out["SOURCE_MW"] - out["TARGET_MW"]).abs()
+
+    if drop_missing_weights:
+        out = out.dropna(subset=["SOURCE_MW", "TARGET_MW"]).reset_index(drop=True)
+
+    if add_ppm:
+        denom = out[["SOURCE_MW", "TARGET_MW"]].mean(axis=1)
+        out["MassDiff_ppm"] = (out["MassDiff_Da"] / denom) * 1e6
+
+    return out
 
 # ========================================
 # MZmine custom MS1 database CSV
@@ -965,6 +1074,14 @@ def dendrogram_and_cluster_descriptors(
     return clusters, Z, fig, ax, df_clustered
 
 
+from typing import Optional, Sequence, Tuple, Union, List
+from pathlib import Path
+import os
+import numpy as np
+import pandas as pd
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler
+
 def tsne_projection_plot(
     df_descriptors: pd.DataFrame,
     *,
@@ -978,17 +1095,34 @@ def tsne_projection_plot(
     perplexity: float = 20.0,
     random_state: int = 0,
     title: str = "t-Distributed Stochastic Neighbor Embedding (t-SNE)",
-    color_palette: Sequence[str] = None,  # Plotly will pick defaults if None
+    color_palette: Sequence[str] = None,  # Plotly picks defaults if None
     save_html: bool = True,
     out_html: str = "images/t-sne.html",
+    # --- New highlight options ---
+    activities_df: Optional[pd.DataFrame] = None,   # e.g., merged_df2 (index must align or be reindexable)
+    activities_col: str = "activities",
+    highlight_activity: Optional[Union[str, List[str]]] = None,  # e.g., "antimicrobial", ["cytotoxic","analgesic"], or "any"
+    highlight_mode: str = "overlay",  # "overlay" (triangles added as a new trace). ("symbol" available if you prefer single-trace)
+    base_marker_size: int = 7,
+    highlight_size: int = 11,
 ) -> Tuple[pd.DataFrame, "plotly.graph_objs.Figure"]:
-    """Compute a 2D t-SNE projection from descriptor table and make an interactive Plotly scatter."""
+    """
+    Compute a 2D t-SNE projection from descriptor table and make an interactive Plotly scatter.
+
+    Highlighting:
+      - Provide activities_df with a column `activities_col` (default "activities").
+      - Set highlight_activity to a string (case-insensitive, matches tokens split by ';'),
+        a list of strings, or "any" to highlight any non-empty activities.
+      - Highlighted points appear as triangle-up markers (overlay trace) with larger size.
+    """
     try:
         import plotly.express as px
         import plotly.io as pio
+        import plotly.graph_objects as go
     except Exception as e:  # pragma: no cover
         raise ImportError("Plotly is required for tsne_projection_plot().") from e
 
+    # --- Prepare data ---
     X = df_descriptors.select_dtypes(include=[np.number])
     if X.empty:
         raise ValueError("No numeric columns found in df_descriptors.")
@@ -1012,12 +1146,15 @@ def tsne_projection_plot(
     Y = tsne.fit_transform(X_use)
     proj = pd.DataFrame(Y, index=X.index, columns=[f"TSNE{i+1}" for i in range(n_components)])
 
-    # color & hover data
+    # --- Color & hover data ---
     color_data = None
     if cluster_series is not None:
         color_data = cluster_series.reindex(proj.index) if not cluster_series.index.equals(proj.index) else cluster_series
     elif (metadata_df is not None) and ("cluster" in metadata_df.columns):
-        color_data = metadata_df.loc[proj.index, "cluster"] if metadata_df.index.equals(proj.index) else None
+        try:
+            color_data = metadata_df.loc[proj.index, "cluster"]
+        except Exception:
+            color_data = None
 
     hover_data = {}
     if metadata_df is not None:
@@ -1026,6 +1163,14 @@ def tsne_projection_plot(
                 s = metadata_df[col]
                 hover_data[col] = s.reindex(proj.index) if not s.index.equals(proj.index) else s
 
+    # Include activities in hover, if present
+    activities_series = None
+    if activities_df is not None and activities_col in activities_df.columns:
+        s = activities_df[activities_col]
+        activities_series = s.reindex(proj.index) if not s.index.equals(proj.index) else s
+        hover_data[activities_col] = activities_series
+
+    # --- Base scatter (circles) ---
     fig = px.scatter(
         proj,
         x="TSNE1",
@@ -1035,6 +1180,52 @@ def tsne_projection_plot(
         hover_data=hover_data if hover_data else None,
         title=title,
     )
+    # Normalize base marker size
+    fig.update_traces(marker=dict(size=base_marker_size), selector=dict(mode="markers"))
+
+    # --- Highlight logic (overlay triangles) ---
+    def _tokenize(val: str) -> list[str]:
+        # split on ';' and commas, trim whitespace
+        return [t.strip() for t in str(val).replace(",", ";").split(";") if t.strip()]
+
+    if activities_series is not None and highlight_activity is not None:
+        # Build boolean mask for highlighting
+        if isinstance(highlight_activity, str) and highlight_activity.lower() == "any":
+            mask = activities_series.fillna("").astype(str).str.strip().ne("")
+        else:
+            # allow a single string or list of strings; case-insensitive token match
+            targets = [highlight_activity] if isinstance(highlight_activity, str) else list(highlight_activity)
+            targets = [str(t).lower().strip() for t in targets if str(t).strip()]
+            def match_tokens(cell):
+                if pd.isna(cell) or str(cell).strip() == "":
+                    return False
+                toks = [t.lower() for t in _tokenize(cell)]
+                # match if any target is contained as full token or substring in any token
+                return any(any(targ in tok for tok in toks) for targ in targets)
+            mask = activities_series.apply(match_tokens)
+
+        if mask.any():
+            hi_idx = proj.index[mask]
+            # Build overlay trace only for highlighted points
+            fig.add_trace(
+                go.Scattergl(
+                    x=proj.loc[hi_idx, "TSNE1"],
+                    y=proj.loc[hi_idx, "TSNE2"],
+                    mode="markers",
+                    name=f"Highlighted: {highlight_activity}",
+                    marker=dict(symbol="triangle-up", size=highlight_size, line=dict(width=1)),
+                    hovertemplate=(
+                        "TSNE1=%{x:.3f}<br>"
+                        "TSNE2=%{y:.3f}<br>"
+                        + "<br>".join([f"{k}=%{{customdata[{i}]}}" for i, k in enumerate(hover_data.keys())])
+                        if hover_data else "TSNE1=%{x:.3f}<br>TSNE2=%{y:.3f}"
+                    ),
+                    customdata=np.column_stack([v.reindex(hi_idx).values for v in hover_data.values()]) if hover_data else None,
+                    showlegend=True,
+                )
+            )
+        else:
+            print("ℹ️ No points matched the requested activity filter; no highlight overlay added.")
 
     if save_html:
         Path(os.path.dirname(out_html) or ".").mkdir(parents=True, exist_ok=True)
@@ -1042,3 +1233,186 @@ def tsne_projection_plot(
 
     return proj, fig
 
+
+
+# ========================================
+# WordCloud of activity column
+# ========================================
+
+
+from collections import Counter
+from typing import Iterable, Optional, Tuple, Dict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+
+
+def wordcloud_from_semicolon_column(
+    df: pd.DataFrame,
+    column: str = "activities",
+    *,
+    delimiter: str = ";",
+    normalize_case: bool = True,
+    stopwords: Optional[Iterable[str]] = None,
+    min_count: int = 1,
+    max_words: int = 500,
+    width: int = 1400,
+    height: int = 900,
+    background_color: str = "white",
+    colormap: Optional[str] = None,           # e.g. "viridis", "plasma", etc.
+    collocations: bool = False,               # keep False to avoid auto bigrams
+    save_path: Optional[str] = None,
+    show: bool = True,
+) -> Tuple[WordCloud, Dict[str, int]]:
+    """
+    Create a word cloud from a DataFrame column whose cells may contain multiple
+    strings separated by a delimiter (default: ';').
+
+    Returns (wordcloud_object, frequency_dict).
+    """
+
+    if column not in df.columns:
+        raise KeyError(f"Column '{column}' not found in DataFrame.")
+
+    # Collect tokens
+    series = df[column].dropna().astype(str)
+    tokens = []
+    for cell in series:
+        for raw in cell.split(delimiter):
+            token = raw.strip()
+            if not token:
+                continue
+            if normalize_case:
+                token = token.lower()
+            tokens.append(token)
+
+    # Apply stopwords (if any)
+    if stopwords is not None:
+        stop_set = {s.lower() if normalize_case else s for s in stopwords}
+        tokens = [t for t in tokens if t not in stop_set]
+
+    # Count frequencies and enforce min_count
+    freqs = Counter(tokens)
+    if min_count > 1:
+        freqs = {k: v for k, v in freqs.items() if v >= min_count}
+    else:
+        freqs = dict(freqs)
+
+    if not freqs:
+        raise ValueError(
+            "No tokens found after processing. "
+            "Check the column name, delimiter, stopwords/min_count, or data."
+        )
+
+    # Build the word cloud from frequencies (stable and exact)
+    wc = WordCloud(
+        width=width,
+        height=height,
+        background_color=background_color,
+        colormap=colormap,
+        max_words=max_words,
+        collocations=collocations,
+        prefer_horizontal=0.9,
+        normalize_plurals=False,
+        regexp=None,  # keep full phrases as tokens (we already split by delimiter)
+    ).generate_from_frequencies(freqs)
+
+    # Save and/or show
+    if save_path:
+        wc.to_file(save_path)
+
+    if show:
+        dpi = 100
+        plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
+        plt.imshow(wc, interpolation="bilinear")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()
+
+    return wc, freqs
+
+
+from collections import Counter
+from typing import Iterable, Optional, Tuple
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def plot_top_terms_from_column(
+    df: pd.DataFrame,
+    column: str = "activities",
+    *,
+    delimiter: str = ";",
+    normalize_case: bool = True,
+    stopwords: Optional[Iterable[str]] = None,
+    min_count: int = 1,
+    top_n: int = 25,
+    save_path: Optional[str] = None,
+    show: bool = True,
+) -> Tuple[pd.DataFrame, plt.Figure, plt.Axes]:
+    """
+    Create a Top-N bar chart of term frequencies from a DataFrame column whose
+    cells may contain multiple entries separated by a delimiter (default: ';').
+
+    Returns (freq_df, fig, ax) where freq_df has columns ['term', 'count'].
+    """
+
+    if column not in df.columns:
+        raise KeyError(f"Column '{column}' not found in DataFrame.")
+
+    # --- tokenize
+    series = df[column].dropna().astype(str)
+    tokens = []
+    for cell in series:
+        for raw in cell.split(delimiter):
+            tok = raw.strip()
+            if not tok:
+                continue
+            if normalize_case:
+                tok = tok.lower()
+            tokens.append(tok)
+
+    # --- stopwords & counts
+    if stopwords is not None:
+        stop_set = {s.lower() if normalize_case else s for s in stopwords}
+        tokens = [t for t in tokens if t not in stop_set]
+
+    counts = Counter(tokens)
+    if min_count > 1:
+        counts = {k: v for k, v in counts.items() if v >= min_count}
+
+    if not counts:
+        raise ValueError(
+            "No tokens to plot after processing. "
+            "Check column values, delimiter, stopwords/min_count."
+        )
+
+    # --- build frequency DataFrame
+    freq_df = (
+        pd.DataFrame(list(counts.items()), columns=["term", "count"])
+        .sort_values("count", ascending=False, kind="stable")
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+
+    # --- plot (horizontal bars; ascending order for nice stacking)
+    plot_df = freq_df.sort_values("count", ascending=True, kind="stable")
+    fig, ax = plt.subplots(figsize=(8, max(3, 0.35 * len(plot_df))))
+    ax.barh(plot_df["term"], plot_df["count"])   # no explicit colors
+    ax.set_xlabel("Count")
+    #ax.set_ylabel("Term")
+    ax.set_title(f"Top {len(plot_df)} terms in '{column}'")
+    for i, v in enumerate(plot_df["count"].to_numpy()):
+        ax.text(v, i, f" {v}", va="center")
+
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+
+    if show:
+        plt.show()
+
+    return freq_df, fig, ax
