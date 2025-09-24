@@ -550,6 +550,43 @@ def massql_query_for_compound(
         )
         out[a] = q
     return out
+    
+def massql_query_for_compound2(
+    name: str,
+    mono_mass: float,
+    adducts: Optional[Sequence[str]] = None,
+    ppm: int = 10,
+    intensity_percent: int = 1,
+    decimals: int = 5,
+    separate_adducts: bool = False,
+) -> str | Dict[str, str]:
+    """Build MassQL query(ies) for one compound (MS1)."""
+    if adducts is None:
+        adducts = ("[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+", "[M+2H]+2")
+
+    mzs = compute_adduct_mzs(mono_mass, adducts=adducts)
+
+    if not separate_adducts:
+        mz_list = " OR ".join(_fmt(mzs[a], decimals) for a in adducts)
+        q = (
+            f"# {name}\n"
+            "QUERY scaninfo(MS2DATA) WHERE\n"
+            f"MS2PREC=(\n\t{mz_list}\n"
+            f"):TOLERANCEPPM={ppm}:INTENSITYPERCENT={intensity_percent}"
+        )
+        return q
+
+    out: Dict[str, str] = {}
+    for a in adducts:
+        q = (
+            f"# {name} {a}\n"
+            "QUERY scaninfo(MS2DATA) WHERE\n"
+            f"MS2PREC=(\n\t{_fmt(mzs[a], decimals)}\n"
+            f"):TOLERANCEPPM={ppm}:INTENSITYPERCENT={intensity_percent}"
+        )
+        out[a] = q
+    return out    
+
 
 def generate_massql_queries(
     df_metadata: pd.DataFrame,
@@ -585,6 +622,39 @@ def generate_massql_queries(
         )
     return results
 
+def generate_massqlPrec_queries(
+    df_metadata: pd.DataFrame,
+    ppm: int = 10,
+    intensity_percent: int = 1,
+    decimals: int = 5,
+    separate_adducts: bool = False,
+    adducts: Optional[Sequence[str]] = None,
+    name_col: str = "Compound name",
+    mass_col: str = "MolWeight",
+) -> Dict[str, str] | Dict[str, Dict[str, str]]:
+    """Build MassQL MS2 (precursors) queries from a metadata dataframe."""
+    if adducts is None:
+        adducts = ("[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+", "[M+2H]+2")
+
+    name_col = _resolve_column(df_metadata, name_col)
+    mass_col = _resolve_column(df_metadata, mass_col)
+
+    results: Dict[str, str] | Dict[str, Dict[str, str]] = {}
+    for _, row in df_metadata.iterrows():
+        name = str(row[name_col])
+        mono = _to_float(row[mass_col])
+        if mono is None:
+            continue
+        results[name] = massql_query_for_compound2(
+            name=name,
+            mono_mass=mono,
+            adducts=adducts,
+            ppm=ppm,
+            intensity_percent=intensity_percent,
+            decimals=decimals,
+            separate_adducts=separate_adducts,
+        )
+    return results
 
 # =============================
 # MassQL (MS2)
