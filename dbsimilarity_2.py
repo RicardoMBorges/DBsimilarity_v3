@@ -1486,3 +1486,737 @@ def plot_top_terms_from_column(
         plt.show()
 
     return freq_df, fig, ax
+
+
+# =========================
+# MGF SURVEY
+# =========================
+# Standard library
+import os
+import re
+import itertools
+from collections import OrderedDict as OD
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    OrderedDict,
+    Sequence,
+    Tuple,
+    Union,
+)
+
+# Third-party libraries
+import numpy as np
+import pandas as pd
+
+# Plotting
+import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
+
+# Mass spectrometry I/O
+from pyteomics import mgf as mgf_reader
+
+# Statistics / ML
+from scipy import stats
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score, pairwise_distances
+
+
+# =========================
+# Safe MGF loading
+#    - uses pyteomics.mgf
+#    - standardizes batch names: basename without extension
+# =========================
+def load_mgf_spectra(directory_path: str) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Safely load all .mgf files from a directory using pyteomics.mgf without indexing (use_index=False),
+    which avoids the 'empty index' warning on some files. The batch name is standardized as the file
+    basename without extension.
+
+    Parameters
+    ----------
+    directory_path : str
+        Path to the folder containing .mgf files.
+
+    Returns
+    -------
+    Dict[str, List[Dict[str, Any]]]
+        A mapping: {batch_name -> list of spectra}, where each spectrum is a dict with:
+        - "params": header parameters
+        - "m/z array": list[float]
+        - "intensity array": list[float]
+    """
+    spectra: Dict[str, List[Dict[str, Any]]] = {}
+    for fn in os.listdir(directory_path):
+        if not fn.lower().endswith(".mgf"):
+            continue
+        batch = os.path.splitext(fn)[0]
+        spectra[batch] = []
+        path = os.path.join(directory_path, fn)
+
+        # No indexing to avoid empty-index warnings
+        for spec in mgf_reader.read(path, use_index=False, convert_arrays=True):
+            mz = spec.get("m/z array", [])
+            ii = spec.get("intensity array", [])
+            params = spec.get("params", {})
+            spectra[batch].append({
+                "params": params,
+                "m/z array": list(map(float, mz)) if len(mz) else [],
+                "intensity array": list(map(float, ii)) if len(ii) else [],
+            })
+    return spectra
+
+import pandas as pd
+
+def _normalize_inchikey_value(x: str | None) -> str | None:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s or s.lower() == "nan":
+        return None
+    s = s.upper()
+    # insert dashes if missing and length is 27 (14-10-1)
+    if "-" not in s and len(s) == 27:
+        s = f"{s[:14]}-{s[14:24]}-{s[24:]}"
+    return s
+
+def _ensure_inchikey_column(df: pd.DataFrame, preferred: str = "InchiKey") -> pd.DataFrame:
+    """
+    Coalesce any InChIKey-like columns into a single 'InchiKey' column (Series),
+    then normalize values.
+    """
+    df = df.copy()
+    aliases = ["InchiKey", "InChIKey", "inchi_key", "inchi-key"]
+    hits = [c for c in df.columns if c.lower() in {a.lower() for a in aliases}]
+    if not hits:
+        raise KeyError("No InChIKey-like column found. Expected one of: InchiKey, InChIKey, inchi_key, inchi-key")
+
+    # Take first non-empty value across all aliases
+    subset = df[hits].astype("string")
+    subset = subset.replace({r"^\s*$": pd.NA, "nan": pd.NA, "NaN": pd.NA}, regex=True)
+    s = subset.bfill(axis=1).iloc[:, 0]  # Series
+
+    # Normalize values (upper, dash pattern)
+    s = s.map(_normalize_inchikey_value)
+
+    # Drop old columns and set the preferred one
+    df = df.drop(columns=hits, errors="ignore")
+    df[preferred] = s
+    return df
+
+
+def _normalize_inchikey_value(x: str | None) -> str | None:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s or s.lower() == "nan":
+        return None
+    s = s.upper()
+    # insert dashes if missing and length is 27 (14-10-1)
+    if "-" not in s and len(s) == 27:
+        s = f"{s[:14]}-{s[14:24]}-{s[24:]}"
+    return s
+
+def _ensure_inchikey_column(df: pd.DataFrame, preferred: str = "InchiKey") -> pd.DataFrame:
+    """
+    Coalesce any InChIKey-like columns into a single 'InchiKey' column (Series),
+    then normalize values.
+    """
+    df = df.copy()
+    aliases = ["InchiKey", "InChIKey", "inchi_key", "inchi-key"]
+    hits = [c for c in df.columns if c.lower() in {a.lower() for a in aliases}]
+    if not hits:
+        raise KeyError("No InChIKey-like column found. Expected one of: InchiKey, InChIKey, inchi_key, inchi-key")
+
+    # Take first non-empty value across all aliases
+    subset = df[hits].astype("string")
+    subset = subset.replace({r"^\s*$": pd.NA, "nan": pd.NA, "NaN": pd.NA}, regex=True)
+    s = subset.bfill(axis=1).iloc[:, 0]  # Series
+
+    # Normalize values (upper, dash pattern)
+    s = s.map(_normalize_inchikey_value)
+
+    # Drop old columns and set the preferred one
+    df = df.drop(columns=hits, errors="ignore")
+    df[preferred] = s
+    return df
+
+# --- helpers ---------------------------------------------------------------
+def _normalize_inchikey_value(x: str | None) -> str | None:
+    """Uppercase, strip, and insert dashes if missing (27 chars total)."""
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s or s.lower() == "nan":
+        return None
+    s = s.upper()
+    if "-" not in s and len(s) == 27:
+        s = f"{s[:14]}-{s[14:24]}-{s[24:]}"
+    return s
+
+def _ensure_inchikey_column(df: pd.DataFrame, preferred: str = "InchiKey") -> pd.DataFrame:
+    """
+    Find any InChIKey-like column and normalize it into a single column named `preferred`.
+    Accepted aliases: InchiKey, InChIKey, inchi_key, inchi-key.
+    """
+    df = df.copy()
+    aliases = {"InchiKey", "InChIKey", "inchi_key", "inchi-key"}
+    hit = None
+    for c in df.columns:
+        if c.lower() in {a.lower() for a in aliases}:
+            hit = c
+            break
+    if hit is None:
+        raise KeyError("No InChIKey-like column found. Expected one of: InchiKey, InChIKey, inchi_key, inchi-key")
+    if hit != preferred:
+        df = df.rename(columns={hit: preferred})
+    df[preferred] = df[preferred].map(_normalize_inchikey_value)
+    return df
+
+def _coalesce_smiles_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep a single 'SMILES' column:
+      - If both 'SMILES' and 'SMILES_nodes' exist, fill nulls in left with right and drop the suffix.
+      - If only 'SMILES_nodes' exists, rename it to 'SMILES'.
+    """
+    df = df.copy()
+    if "SMILES" in df.columns and "SMILES_nodes" in df.columns:
+        df["SMILES"] = df["SMILES"].astype("string").fillna(df["SMILES_nodes"])
+        df = df.drop(columns=["SMILES_nodes"])
+    elif "SMILES_nodes" in df.columns and "SMILES" not in df.columns:
+        df = df.rename(columns={"SMILES_nodes": "SMILES"})
+    return df
+
+# --- main merge ------------------------------------------------------------
+def merge_on_inchikey(left: pd.DataFrame, right: pd.DataFrame, how: str = "left") -> pd.DataFrame:
+    """
+    Merge two DataFrames on the column 'InchiKey' (this exact casing).
+    - Normalizes/renames any InChIKey-like columns to 'InchiKey'
+    - Coalesces SMILES into a single column
+    - Ensures only one 'InchiKey' column remains
+    """
+    L = _ensure_inchikey_column(left, preferred="InchiKey")
+    R = _ensure_inchikey_column(right, preferred="InchiKey")
+
+    out = pd.merge(L, R, on="InchiKey", how=how, suffixes=("", "_nodes"))
+
+    # Remove any accidental duplicate key columns (defensive)
+    dups = [c for c in out.columns if c.lower() in {"inchikey_nodes", "inchikey_x", "inchikey_y"}]
+    if dups:
+        out = out.drop(columns=dups)
+
+    # SMILES coalesce
+    out = _coalesce_smiles_column(out)
+
+    return out
+
+# ---- helpers ---------------------------------------------------------------
+def _first_param(params, keys):
+    for k in keys:
+        if k in params:
+            v = params[k]
+            if isinstance(v, (list, tuple)):
+                return v[0] if v else None
+            return v
+    return None
+
+def get_precursor_mz(params: dict) -> float | None:
+    """Extract precursor m/z from PEPMASS (or fallbacks)."""
+    # Try PEPMASS first (pyteomics often keeps the original case)
+    for key in list(params.keys()):
+        if key.lower() == "pepmass":
+            v = params[key]
+            # v can be: tuple/list (mz, intensity) OR string "mz intensity" OR a single float
+            if isinstance(v, (tuple, list)):
+                try: return float(v[0])
+                except Exception: pass
+            elif isinstance(v, str):
+                toks = v.replace(",", " ").split()
+                if toks:
+                    try: return float(toks[0])
+                    except Exception: pass
+            else:
+                try: return float(v)
+                except Exception: pass
+
+    # Fallback field names seen in the wild
+    for alt in ("precursor_mz", "precursorMz", "parentmass", "ParentMass", "ms2precursor", "MS2Precursor"):
+        if alt in params:
+            v = params[alt]
+            if isinstance(v, (tuple, list)):
+                try: return float(v[0])
+                except Exception: pass
+            elif isinstance(v, str):
+                toks = v.replace(",", " ").split()
+                if toks:
+                    try: return float(toks[0])
+                    except Exception: pass
+            else:
+                try: return float(v)
+                except Exception: pass
+    return None
+
+def extract_scans_fields(params: dict) -> tuple[str | None, int | None]:
+    """Return ('scans' as-is, scan_number as int if parseable)."""
+    scans_val = _first_param(params, ["SCANS","scans","scan","SCAN","scan_number","SCAN_NUMBER","FEATURE_ID","feature_id"])
+    scan_number = None
+    if scans_val is not None:
+        s = str(scans_val).strip()
+        m = re.search(r"\d+", s)
+        if m:
+            try:
+                scan_number = int(m.group(0))
+            except Exception:
+                scan_number = None
+    return scans_val, scan_number
+
+def select_fragments(
+    mzs: list[float] | np.ndarray,
+    intens: list[float] | np.ndarray,
+    *,
+    top_n: int = 6,
+    min_rel_pct: float = 1.0,
+    mz_decimals: int = 4,
+    rel_decimals: int = 1,
+) -> str:
+    """Return semicolon-separated 'mz:rel%' for peaks ≥ min_rel_pct, keeping top_n by rel intensity."""
+    if mzs is None or intens is None:
+        return ""
+    if len(mzs) == 0 or len(intens) == 0 or len(mzs) != len(intens):
+        return ""
+
+    arr = np.column_stack([np.asarray(mzs, float), np.asarray(intens, float)])
+    if arr.size == 0:
+        return ""
+
+    base = arr[:, 1].max()
+    if not np.isfinite(base) or base <= 0:
+        return ""
+
+    rel = (arr[:, 1] / base) * 100.0
+    keep = rel >= float(min_rel_pct)
+    if not np.any(keep):
+        return ""
+
+    kept = np.column_stack([arr[keep, 0], rel[keep]])
+    # sort by rel desc, tie-break by m/z asc
+    order = np.lexsort((kept[:, 0], -kept[:, 1]))
+    kept = kept[order][:top_n]
+
+    parts = [f"{round(mz, mz_decimals)}:{round(r, rel_decimals)}" for mz, r in kept]
+    return ";".join(parts)
+
+# ---- main function ---------------------------------------------------------
+def spectra_to_dataframe(
+    spectra_by_batch: dict[str, list[dict]],
+    *,
+    top_n: int = 6,
+    min_rel_pct: float = 1.0,
+) -> pd.DataFrame:
+    """
+    Build a DataFrame from spectra with:
+      - 'batch', 'scans', 'scan_number'
+      - 'precursor_mass'
+      - 'fragments' (top_n peaks with ≥ min_rel_pct, formatted 'mz:rel%')
+      - 'n_fragments'
+    """
+    rows = []
+    for batch, spectra in spectra_by_batch.items():
+        for spec in spectra:
+            params = spec.get("params", {}) or {}
+            mzs = spec.get("m/z array") or []
+            intens = spec.get("intensity array") or []
+
+            scans, scan_number = extract_scans_fields(params)
+            precursor = get_precursor_mz(params)
+            frag_str = select_fragments(mzs, intens, top_n=top_n, min_rel_pct=min_rel_pct)
+
+            rows.append({
+                "batch": batch,
+                "scans": scans,
+                "scan_number": scan_number,
+                "precursor_mass": precursor,
+                "fragments": frag_str,
+                "n_fragments": frag_str.count(";") + 1 if frag_str else 0,
+            })
+    return pd.DataFrame(rows)
+
+
+
+from pathlib import Path
+import xml.etree.ElementTree as ET
+import numpy as np
+import pandas as pd
+
+def graphml_to_dataframe(
+    filename: str | Path,
+    *,
+    resources_dir: str | Path | None = None,
+    cast_numeric: bool = True,
+    write_csv: bool = False,
+    out_csv: str | Path | None = None,
+) -> pd.DataFrame:
+    """
+    GraphML → DataFrame (nodes). Accepts absolute path or just a filename.
+    If only a filename is given, searches in resources_dir (default: ../resources),
+    first directly, then recursively with rglob.
+    """
+    # --- resolve path robustly ---
+    fn = Path(filename)
+    if fn.is_absolute() and fn.exists():
+        path = fn
+    else:
+        base = Path(resources_dir) if resources_dir else (Path.cwd().parent / "resources")
+        direct = (base / fn.name)
+        if direct.exists():
+            path = direct
+        else:
+            matches = list(base.rglob(fn.name))  # recursive search under resources_dir
+            if matches:
+                path = matches[0]
+            else:
+                raise FileNotFoundError(
+                    "GraphML not found.\n"
+                    f"Tried:\n - {direct}\n"
+                    f"And recursive under: {base}\n"
+                    "Tip: pass an absolute path or fix RESOURCES_DIR."
+                )
+
+    # --- mapping d# → columns ---
+    extract_keys = {
+        "d0":"d0","d1":"d1","d2":"d2","d3":"d3","d4":"d4","d5":"d5",
+        "d6":"SMILES","d7":"InChI",
+        "d8":"d8","d9":"d9","d10":"d10","d11":"d11","d12":"d12","d13":"d13",
+    }
+
+    rows = []
+    for event, elem in ET.iterparse(path, events=("end",)):
+        if elem.tag.endswith("node"):
+            row = {"id": elem.get("id")}
+            for data_el in elem:
+                if not data_el.tag.endswith("data"):
+                    continue
+                k = data_el.get("key")
+                if k in extract_keys:
+                    txt = (data_el.text or "").strip() if data_el.text else ""
+                    val = np.nan if txt == "" or txt.lower() == "nan" else txt
+                    row[extract_keys[k]] = val
+            rows.append(row)
+            elem.clear()
+
+    df = pd.DataFrame(rows)
+    # nice order
+    desired = ["id","d0","d1","d2","d3","d4","d5","SMILES","InChI","d8","d9","d10","d11","d12","d13"]
+    df = df[[c for c in desired if c in df.columns]]
+
+    if cast_numeric:
+        for c in ["d0","d1","d2","d3","d4","d5","d8","d9","d10","d11","d12","d13"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if write_csv:
+        out_csv = Path(out_csv) if out_csv else path.with_name(path.stem + "_nodes_extracted.csv")
+        df.to_csv(out_csv, index=False)
+
+    return df
+
+# Requires RDKit with InChI support
+from rdkit import Chem
+from rdkit.Chem import inchi
+import pandas as pd
+
+def add_inchikey_from_structures(
+    df: pd.DataFrame,
+    smiles_col: str = "SMILES",
+    inchi_col: str = "InChI",
+    out_col: str = "InchiKey",
+) -> pd.DataFrame:
+    df = df.copy()
+    if out_col not in df.columns:
+        df[out_col] = pd.NA
+
+    def key_from_smiles(s):
+        if not isinstance(s, str) or not s.strip():
+            return None
+        m = Chem.MolFromSmiles(s)
+        if m is None:
+            return None
+        try:
+            return inchi.MolToInchiKey(m)
+        except Exception:
+            return None
+
+    def key_from_inchi(s):
+        if not isinstance(s, str) or not s.strip():
+            return None
+        try:
+            return inchi.InchiToInchiKey(s)
+        except Exception:
+            return None
+
+    # 1) If you have InChI, use it first (fast & canonical)
+    if inchi_col in df.columns:
+        mask = df[out_col].isna()
+        df.loc[mask, out_col] = df.loc[mask, inchi_col].apply(key_from_inchi)
+
+    # 2) Fill remaining via SMILES
+    if smiles_col in df.columns:
+        mask = df[out_col].isna()
+        df.loc[mask, out_col] = df.loc[mask, smiles_col].apply(key_from_smiles)
+
+    # Normalize casing
+    df[out_col] = df[out_col].astype("string").str.strip().str.upper()
+
+    return df
+
+import pandas as pd
+
+# --- reuse the same normalizer you already used ---
+def _normalize_inchikey_value(x: str | None) -> str | None:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s or s.lower() == "nan":
+        return None
+    s = s.upper()
+    if "-" not in s and len(s) == 27:  # insert dashes if compact form
+        s = f"{s[:14]}-{s[14:24]}-{s[24:]}"
+    return s
+
+def _ensure_inchikey_column(df: pd.DataFrame, preferred: str = "InchiKey") -> pd.DataFrame:
+    df = df.copy()
+    aliases = ["InchiKey", "InChIKey", "inchi_key", "inchi-key"]
+    hits = [c for c in df.columns if c.lower() in {a.lower() for a in aliases}]
+    if not hits:
+        raise KeyError("No InChIKey-like column found. Expected one of: InchiKey, InChIKey, inchi_key, inchi-key")
+    subset = df[hits].astype("string").replace({r"^\s*$": pd.NA, "nan": pd.NA, "NaN": pd.NA}, regex=True)
+    s = subset.bfill(axis=1).iloc[:, 0].map(_normalize_inchikey_value)  # first non-null across aliases
+    df = df.drop(columns=hits, errors="ignore")
+    df[preferred] = s
+    return df
+
+def inchikey_match_report(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    *,
+    left_name: str = "merged_df",
+    right_name: str = "df_nodes",
+    show_examples: int = 5,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, list[str], list[str]]:
+    # --- internal helpers (self-contained) ---
+    def _normalize_inchikey_value(x):
+        if x is None:
+            return None
+        s = str(x).strip()
+        if not s or s.lower() == "nan":
+            return None
+        s = s.upper()
+        if "-" not in s and len(s) == 27:
+            s = f"{s[:14]}-{s[14:24]}-{s[24:]}"
+        return s
+
+    def _ensure_inchikey_column(df: pd.DataFrame, preferred: str = "InchiKey") -> pd.DataFrame:
+        df = df.copy()
+        aliases = ["InchiKey", "InChIKey", "inchi_key", "inchi-key"]
+        hits = [c for c in df.columns if c.lower() in {a.lower() for a in aliases}]
+        if not hits:
+            raise KeyError("No InChIKey-like column found. Expected one of: InchiKey, InChIKey, inchi_key, inchi-key")
+        subset = df[hits].astype("string").replace({r"^\s*$": pd.NA, "nan": pd.NA, "NaN": pd.NA}, regex=True)
+        s = subset.bfill(axis=1).iloc[:, 0].map(_normalize_inchikey_value)
+        df = df.drop(columns=hits, errors="ignore")
+        df["InchiKey"] = s
+        return df
+
+    # --- normalize keys on both sides ---
+    L = _ensure_inchikey_column(left, preferred="InchiKey")
+    R = _ensure_inchikey_column(right, preferred="InchiKey")
+
+    lkeys = L["InchiKey"].dropna()
+    rkeys = R["InchiKey"].dropna()
+    lset, rset = set(lkeys), set(rkeys)
+    inter = lset & rset
+    union = lset | rset
+
+    # row-level matches in left (this equals “entries merged” for a left join)
+    row_match_mask = L["InchiKey"].isin(rset)
+    n_row_matches = int(row_match_mask.sum())
+
+    # duplicates per side
+    ldups = lkeys.value_counts()
+    ldups = ldups[ldups > 1]
+    rdups = rkeys.value_counts()
+    rdups = rdups[rdups > 1]
+
+    summary = pd.DataFrame({
+        "metric": [
+            f"{left_name} rows",
+            f"{right_name} rows",
+            f"{left_name} unique InchiKey",
+            f"{right_name} unique InchiKey",
+            "unique matches (intersection)",
+            "unique union",
+            f"row-level matches in {left_name}",
+            f"entries merged (left join {left_name}→{right_name})",   # <- added
+            f"unique match rate vs {left_name}",
+            f"unique match rate vs {right_name}",
+            f"row-level match rate in {left_name}",
+            f"entries merged rate in {left_name}",                    # <- added
+            f"{left_name} duplicated InchiKey (keys)",
+            f"{right_name} duplicated InchiKey (keys)",
+        ],
+        "value": [
+            len(L),
+            len(R),
+            len(lset),
+            len(rset),
+            len(inter),
+            len(union),
+            n_row_matches,
+            n_row_matches,  # same as row-level matches, explicit “merged” count
+            (len(inter) / len(lset)) if lset else 0.0,
+            (len(inter) / len(rset)) if rset else 0.0,
+            (n_row_matches / len(L)) if len(L) else 0.0,
+            (n_row_matches / len(L)) if len(L) else 0.0,  # explicit merged rate
+            int(ldups.shape[0]),
+            int(rdups.shape[0]),
+        ],
+    })
+
+    sample_missing_in_left  = sorted(list(lset - rset))[:show_examples]
+    sample_missing_in_right = sorted(list(rset - lset))[:show_examples]
+
+    return summary, ldups, rdups, sample_missing_in_left, sample_missing_in_right
+
+import re
+import pandas as pd
+import numpy as np
+
+def merge_nodes_with_mgf(
+    merged_df_plus_nodes: pd.DataFrame,
+    mgfdata_df: pd.DataFrame,
+    *,
+    dedupe_mgf: bool = True,
+    prefer_mgf_fragments: bool = True,
+    drop_nan_fragments: bool = False,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Merge node table (with 'id') and MGF table (with 'scan_number').
+
+    Steps:
+      1) Normalize join keys:
+         - nodes:  from 'id'        → string digits (e.g., "94850")
+         - mgf:    from 'scan_number' → string digits
+      2) Optional dedup of mgf rows with same scan_number:
+         keep highest n_fragments, tie-break by higher precursor_mass.
+      3) Left-join nodes ← mgf   on normalized keys.
+      4) Coalesce Fragments (prefer MGF if prefer_mgf_fragments=True).
+      5) Optional: drop rows where final Fragments is NaN/empty.
+      6) Return (merged_df, summary_dict).
+
+    Returns
+    -------
+    merged : pd.DataFrame
+    summary : dict
+        {
+          'left_rows', 'right_rows',
+          'unique_ids', 'unique_scans',
+          'matched_rows', 'match_rate_rows',
+          'unmatched_id_examples': [... up to 5 keys ...]
+        }
+    """
+
+    def _norm_id_to_str(x):
+        if pd.isna(x):
+            return pd.NA
+        s = str(x).strip()
+        m = re.search(r"\d+", s)
+        return m.group(0) if m else pd.NA
+
+    def _norm_scan_to_str(x):
+        if pd.isna(x):
+            return pd.NA
+        try:
+            return str(int(x))
+        except Exception:
+            s = str(x).strip()
+            m = re.search(r"\d+", s)
+            return m.group(0) if m else pd.NA
+
+    nodes = merged_df_plus_nodes.copy()
+    mgf   = mgfdata_df.copy()
+
+    # --- build normalized keys ---
+    nodes["_id_key"]  = nodes["id"].apply(_norm_id_to_str)
+    mgf["_scan_key"]  = mgf["scan_number"].apply(_norm_scan_to_str)
+
+    # --- optional dedupe on mgf by scan key ---
+    if dedupe_mgf and mgf["_scan_key"].duplicated().any():
+        # Replace NaNs for sorting
+        mgf["n_fragments"]   = pd.to_numeric(mgf.get("n_fragments"), errors="coerce").fillna(0)
+        mgf["precursor_mass"] = pd.to_numeric(mgf.get("precursor_mass"), errors="coerce").fillna(-np.inf)
+        mgf = (mgf
+               .sort_values(["_scan_key", "n_fragments", "precursor_mass"],
+                            ascending=[True, False, False])
+               .drop_duplicates(subset=["_scan_key"], keep="first"))
+
+    # --- merge ---
+    merged = pd.merge(
+        nodes,
+        mgf,
+        left_on="_id_key",
+        right_on="_scan_key",
+        how="left",
+        suffixes=("", "_mgf")
+    )
+
+    # --- coalesce Fragments (prefer mgf if requested) ---
+    # Normalize empties to NA before coalescing
+    if "Fragments" in merged.columns:
+        merged["Fragments"] = merged["Fragments"].replace("", pd.NA)
+    if "Fragments_mgf" in merged.columns:
+        merged["Fragments_mgf"] = merged["Fragments_mgf"].replace("", pd.NA)
+
+    if "Fragments_mgf" in merged.columns:
+        if prefer_mgf_fragments:
+            merged["Fragments"] = merged["Fragments_mgf"].combine_first(merged.get("Fragments"))
+        else:
+            merged["Fragments"] = merged.get("Fragments").combine_first(merged["Fragments_mgf"])
+        merged = merged.drop(columns=["Fragments_mgf"])
+
+    # --- optional: drop rows with missing/empty Fragments after coalescing ---
+    if drop_nan_fragments and "Fragments" in merged.columns:
+        merged = merged[merged["Fragments"].notna()].copy()
+
+    # --- cleanup helper keys ---
+    merged = merged.drop(columns=["_id_key", "_scan_key"], errors="ignore")
+
+    # --- summary ---
+    left_rows  = len(nodes)
+    right_rows = len(mgfdata_df)
+    unique_ids = nodes["_id_key"].dropna().nunique()
+    unique_scans = mgf["_scan_key"].dropna().nunique()
+    matched_rows = merged["scan_number"].notna().sum()  # row-level match on left
+    match_rate_rows = (matched_rows / left_rows) if left_rows else 0.0
+
+    # Sample unmatched id keys (up to 5)
+    left_keys = set(nodes["_id_key"].dropna())
+    right_keys = set(mgf["_scan_key"].dropna())
+    unmatched_id_examples = sorted(list(left_keys - right_keys))[:5]
+
+    summary = dict(
+        left_rows=left_rows,
+        right_rows=right_rows,
+        unique_ids=unique_ids,
+        unique_scans=unique_scans,
+        matched_rows=int(matched_rows),
+        match_rate_rows=float(match_rate_rows),
+        unmatched_id_examples=unmatched_id_examples,
+    )
+
+    return merged, summary
